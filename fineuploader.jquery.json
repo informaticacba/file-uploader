@@ -6,37 +6,36 @@
     "upload",
     "file",
     "chunking",
-    "file-uploader"
+    "file-uploader",
+    "s3",
+    "aws",
+    "amazon",
+    "input",
+    "form",
+    "ui",
+    "azure",
+    "microsoft"
   ],
-  "version": "3.3.0",
+  "version": "4.3.1",
   "author": {
-    "name": "Andrew Valums and Ray Nicholus"
+    "name": "Widen Enterprises",
+    "url": "http://widen.com"
   },
-  "maintainers": [
-    {
-      "name": "Ray Nicholus",
-      "url": "http://lnkd.in/Nkhx2C"
-    }
-  ],
   "licenses": [
     {
-      "type": "MIT",
-      "url": "http://opensource.org/licenses/MIT"
+      "type": "GPL 3",
+      "url": "http://www.gnu.org/licenses/gpl-3.0.txt"
     },
     {
-      "type": "GPL 2",
-      "url": "http://www.gnu.org/licenses/gpl-2.0.txt"
-    },
-    {
-      "type": "LGPL 2",
-      "url": "http://www.gnu.org/licenses/lgpl-2.0.txt"
+      "type": "Widen Commerical License",
+      "url": "http://fineuploader.com/licensing.html"
     }
   ],
-  "bugs": "https://github.com/valums/file-uploader/issues",
+  "bugs": "https://github.com/Widen/fine-uploader/issues",
   "homepage": "http://fineuploader.com",
-  "demo": "http://fineuploader.com",
-  "docs": "https://github.com/valums/file-uploader/blob/master/readme.md",
-  "download": "https://github.com/valums/file-uploader/wiki/Releases",
+  "demo": "http://fineuploader.com/demos.html",
+  "docs": "http://docs.fineuploader.com",
+  "download": "http://fineuploader.com/downloads.html",
   "dependencies": {
     "jquery": ">=1.5"
   }
