@@ -1,6 +1,7 @@
 .*
 *.ipr
 *~
+*.bak
 .*.sw[a-z]
 *.iml
 !.gitignore
