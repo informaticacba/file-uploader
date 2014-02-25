@@ -1,10 +1,12 @@
-.*
+
 *.ipr
 *~
 *.bak
 .*.sw[a-z]
 *.iml
 !.gitignore
+!.gitattributes
+!.gitmodules
 !.jshintrc
 !.jshintignore
 Thumbs.db
