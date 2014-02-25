@@ -20,18 +20,6 @@ qq.AbstractUploadHandlerXhr = function(spec) {
         log = proxy.log;
 
 
-    function getChunk(fileOrBlob, startByte, endByte) {
-        if (fileOrBlob.slice) {
-            return fileOrBlob.slice(startByte, endByte);
-        }
-        else if (fileOrBlob.mozSlice) {
-            return fileOrBlob.mozSlice(startByte, endByte);
-        }
-        else if (fileOrBlob.webkitSlice) {
-            return fileOrBlob.webkitSlice(startByte, endByte);
-        }
-    }
-
     function abort(id) {
         var xhr = fileState[id].xhr,
             ajaxRequester = fileState[id].currentAjaxRequester;
@@ -120,12 +108,14 @@ qq.AbstractUploadHandlerXhr = function(spec) {
         },
 
         updateBlob: function(id, newBlob) {
-            fileState[id].file = newBlob;
+            if (this.isValid(id)) {
+                fileState[id].file = newBlob;
+            }
         },
 
         // Causes handler code to re-evaluate the current blob for chunking
         reevaluateChunking: function(id) {
-            if (chunking) {
+            if (chunking && this.isValid(id)) {
                 delete fileState[id].chunking;
             }
         },
@@ -183,7 +173,7 @@ qq.AbstractUploadHandlerXhr = function(spec) {
                 start: startBytes,
                 end: endBytes,
                 count: totalChunks,
-                blob: getChunk(fileOrBlob, startBytes, endBytes),
+                blob: qq.sliceBlob(fileOrBlob, startBytes, endBytes),
                 size: endBytes - startBytes
             };
         },

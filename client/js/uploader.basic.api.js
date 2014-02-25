@@ -299,6 +299,30 @@
             }
 
             return null;
+        },
+
+        scaleImage: function(id, specs) {
+            var self = this;
+
+            return qq.Scaler.prototype.scaleImage(id, specs, {
+                log: qq.bind(self.log, self),
+                getFile: qq.bind(self.getFile, self),
+                uploadData: self._uploadData
+            });
+        },
+
+        // Parent ID for a specific file, or null if this is the parent, or if it has no parent.
+        getParentId: function(id) {
+            var uploadDataEntry = this.getUploads({id: id}),
+                parentId = null;
+
+            if (uploadDataEntry) {
+                if (uploadDataEntry.parentId !== undefined) {
+                    parentId = uploadDataEntry.parentId;
+                }
+            }
+
+            return parentId;
         }
     };
 
@@ -386,24 +410,29 @@
 
         // Updates internal state when a new file has been received, and adds it along with its ID to a passed array.
         _handleNewFile: function(file, newFileWrapperList) {
-            var uuid = qq.getUniqueId(),
+            var self = this,
+                uuid = qq.getUniqueId(),
                 size = -1,
                 name = qq.getFilename(file),
-                actualFile = file.blob || file;
+                actualFile = file.blob || file,
+                handler = this._customNewFileHandler ? this._customNewFileHandler : qq.bind(self._handleNewFileGeneric, self);
 
             if (actualFile.size >= 0) {
                 size = actualFile.size;
             }
 
-            if (this._scaler.enabled) {
-                this._handleNewFileWithScaling(actualFile, name, uuid, size, newFileWrapperList);
-            }
-            else {
-                this._handleNewFileWithoutScaling(actualFile, name, uuid, size, newFileWrapperList);
-            }
+            handler(actualFile, name, uuid, size, newFileWrapperList, this._options.request.uuidName, {
+                uploadData: self._uploadData,
+                paramsStore: self._paramsStore,
+                addFileToHandler: function(id, file) {
+                    self._handler.add(id, file);
+                    self._netUploadedOrQueued++;
+                    self._trackButton(id);
+                }
+            });
         },
 
-        _handleNewFileWithoutScaling: function(file, name, uuid, size, fileList) {
+        _handleNewFileGeneric: function(file, name, uuid, size, fileList) {
             var id = this._uploadData.addFile(uuid, name, size);
 
             this._handler.add(id, file);
@@ -412,31 +441,6 @@
             this._netUploadedOrQueued++;
 
             fileList.push({id: id, file: file});
-        },
-
-        _handleNewFileWithScaling: function(file, name, uuid, size, fileList) {
-            var self = this,
-                buttonId = file.qqButtonId || (file.blob && file.blob.qqButtonId);
-
-            qq.each(this._scaler.getFileRecords(uuid, name, file), function(idx, record) {
-                var relatedBlob = file,
-                    relatedSize = size,
-                    id;
-
-                if (record.blob instanceof qq.BlobProxy) {
-                    relatedBlob = record.blob;
-                    relatedSize = -1;
-                }
-
-                id = self._uploadData.addFile(record.uuid, record.name, relatedSize);
-                self._handler.add(id, relatedBlob);
-                self._netUploadedOrQueued++;
-                fileList.push({id: id, file: relatedBlob});
-
-                if (buttonId) {
-                    self._buttonIdsForFileIds[id] = buttonId;
-                }
-            });
         },
 
         // Maps a file with the button that was used to select it.
@@ -509,7 +513,7 @@
                 fileBlobOrInput = buttonOrFileInputOrFile;
 
             // We want the reference file/blob here if this is a proxy (a file that will be generated on-demand later)
-            if (qq.BlobProxy && fileBlobOrInput instanceof qq.BlobProxy) {
+            if (fileBlobOrInput instanceof qq.BlobProxy) {
                 fileBlobOrInput = fileBlobOrInput.referenceBlob;
             }
 
@@ -659,11 +663,22 @@
                     resume: this._options.resume,
                     blobs: this._options.blobs,
                     log: qq.bind(self.log, self),
+                    preventRetryParam: this._options.retry.preventRetryResponseProperty,
                     onProgress: function(id, name, loaded, total){
                         self._onProgress(id, name, loaded, total);
                         self._options.callbacks.onProgress(id, name, loaded, total);
                     },
-                    onComplete: function(id, name, result, xhr){
+                    onComplete: function(id, name, result, xhr) {
+                        var status = self.getUploads({id: id}).status;
+
+                        // This is to deal with some observed cases where the XHR readyStateChange handler is
+                        // invoked by the browser multiple times for the same XHR instance with the same state
+                        // readyState value.  Higher level: don't invoke complete-related code if we've already
+                        // done this.
+                        if (status === qq.status.UPLOAD_SUCCESSFUL || status === qq.status.UPLOAD_FAILED) {
+                            return;
+                        }
+
                         var retVal = self._onComplete(id, name, result, xhr);
 
                         // If the internal `_onComplete` handler returns a promise, don't invoke the `onComplete` callback
@@ -710,7 +725,16 @@
                     getName: qq.bind(self.getName, self),
                     getUuid: qq.bind(self.getUuid, self),
                     getSize: qq.bind(self.getSize, self),
-                    setSize: qq.bind(self._setSize, self)
+                    setSize: qq.bind(self._setSize, self),
+                    isQueued: function(id) {
+                        var status = self.getUploads({id: id}).status;
+                        return status === qq.status.QUEUED ||
+                            status === qq.status.SUBMITTED ||
+                            status === qq.status.UPLOAD_RETRYING;
+                    },
+                    getIdsInGroup: function(id) {
+                        return self.getUploads({id: id}).groupIds;
+                    }
                 };
 
             qq.each(this._options.request, function(prop, val) {
@@ -841,6 +865,10 @@
             if (!result.success) {
                 this._netUploadedOrQueued--;
                 this._uploadData.setStatus(id, qq.status.UPLOAD_FAILED);
+
+                if (result[this._options.retry.preventRetryResponseProperty] === true) {
+                    this._preventRetries[id] = true;
+                }
             }
             else {
                 if (result.thumbnailUrl) {
@@ -1298,7 +1326,7 @@
         _validateFileOrBlobData: function(fileWrapper, validationDescriptor) {
             var self = this,
                 file = (function() {
-                    if (qq.BlobProxy && fileWrapper.file instanceof qq.BlobProxy) {
+                    if (fileWrapper.file instanceof qq.BlobProxy) {
                         return fileWrapper.file.referenceBlob;
                     }
                     return fileWrapper.file;
@@ -1486,7 +1514,7 @@
         },
 
         _getValidationDescriptor: function(fileWrapper) {
-            if (qq.BlobProxy && fileWrapper.file instanceof qq.BlobProxy) {
+            if (fileWrapper.file instanceof qq.BlobProxy) {
                 return {
                     name: qq.getFilename(fileWrapper.file.referenceBlob),
                     size: fileWrapper.file.referenceBlob.size
@@ -1502,6 +1530,7 @@
         _createStore: function(initialValue, readOnlyValues) {
             var store = {},
                 catchall = initialValue,
+                perIdReadOnlyValues = {},
                 copy = function(orig) {
                     if (qq.isObject(orig)) {
                         return qq.extend({}, orig);
@@ -1514,9 +1543,13 @@
                     }
                     return readOnlyValues;
                 },
-                includeReadOnlyValues = function(existing) {
+                includeReadOnlyValues = function(id, existing) {
                     if (readOnlyValues && qq.isObject(existing)) {
                         qq.extend(existing, getReadOnlyValues());
+                    }
+
+                    if (perIdReadOnlyValues[id]) {
+                        qq.extend(existing, perIdReadOnlyValues[id]);
                     }
                 };
 
@@ -1540,12 +1573,20 @@
                         values = store[id];
                     }
                     else {
-                        values = catchall;
+                        values = copy(catchall);
                     }
 
-                    includeReadOnlyValues(values);
+                    includeReadOnlyValues(id, values);
 
                     return copy(values);
+                },
+
+                addReadOnly: function(id, values) {
+                    // Only applicable to Object stores
+                    if (qq.isObject(store)) {
+                        perIdReadOnlyValues[id] = perIdReadOnlyValues[id] || {};
+                        qq.extend(perIdReadOnlyValues[id], values);
+                    }
                 },
 
                 remove: function(fileId) {
@@ -1554,6 +1595,7 @@
 
                 reset: function() {
                     store = {};
+                    perIdReadOnlyValues = {};
                     catchall = initialValue;
                 }
             };

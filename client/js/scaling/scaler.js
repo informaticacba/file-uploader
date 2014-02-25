@@ -1,4 +1,4 @@
-/* globals qq */
+/* globals qq, ExifRestorer */
 /**
  * Controls generation of scaled images based on a reference image encapsulated in a `File` or `Blob`.
  * Scaled images are generated and converted to blobs on-demand.
@@ -12,9 +12,61 @@ qq.Scaler = function(spec, log) {
     "use strict";
 
     var self = this,
-        sendOriginal = spec.sendOriginal,
+        includeReference = spec.sendOriginal,
         orient = spec.orient,
-        sizes = this._getSortedSizes(spec.sizes);
+        defaultType = spec.defaultType,
+        defaultQuality = spec.defaultQuality / 100,
+        failedToScaleText = spec.failureText,
+        includeExif = spec.includeExif,
+        sizes = this._getSortedSizes(spec.sizes),
+
+        getFileRecords = function(originalFileUuid, originalFileName, originalBlobOrBlobData) {
+            var self = this,
+                records = [],
+                originalBlob = originalBlobOrBlobData.blob ? originalBlobOrBlobData.blob : originalBlobOrBlobData,
+                idenitifier = new qq.Identify(originalBlob, log);
+
+            // If the reference file cannot be rendered natively, we can't create scaled versions.
+            if (idenitifier.isPreviewableSync()) {
+                // Create records for each scaled version & add them to the records array, smallest first.
+                qq.each(sizes, function(idx, sizeRecord) {
+                    var outputType = self._determineOutputType({
+                        defaultType: defaultType,
+                        requestedType: sizeRecord.type,
+                        refType: originalBlob.type
+                    });
+
+                    records.push({
+                        uuid: qq.getUniqueId(),
+                        name: self._getName(originalFileName, {
+                            name: sizeRecord.name,
+                            type: outputType,
+                            refType: originalBlob.type
+                        }),
+                        blob: new qq.BlobProxy(originalBlob,
+                            qq.bind(self._generateScaledImage, self, {
+                                maxSize: sizeRecord.maxSize,
+                                orient: orient,
+                                type: outputType,
+                                quality: defaultQuality,
+                                failedText: failedToScaleText,
+                                includeExif: includeExif,
+                                log: log
+                            }))
+                        }
+                    );
+                });
+            }
+
+            // Finally, add a record for the original file (if requested)
+            includeReference && records.push({
+                uuid: originalFileUuid,
+                name: originalFileName,
+                blob: originalBlob
+            });
+
+            return records;
+        };
 
     // Revealed API for instances of this module
     qq.extend(this, {
@@ -25,35 +77,212 @@ qq.Scaler = function(spec, log) {
         getFileRecords: function(originalFileUuid, originalFileName, originalBlobOrBlobData) {
             var self = this,
                 records = [],
-                originalBlob = originalBlobOrBlobData.blob ? originalBlobOrBlobData.blob : originalBlobOrBlobData;
+                originalBlob = originalBlobOrBlobData.blob ? originalBlobOrBlobData.blob : originalBlobOrBlobData,
+                idenitifier = new qq.Identify(originalBlob, log);
 
-            // Create records for each scaled version & add them to the records array, smallest first.
-            qq.each(sizes, function(idx, sizeRecord) {
-                records.push({
-                    uuid: qq.getUniqueId(),
-                    name: self._getName(originalFileName, {
-                        name: sizeRecord.name,
-                        type: sizeRecord.type,
+            // If the reference file cannot be rendered natively, we can't create scaled versions.
+            if (idenitifier.isPreviewableSync()) {
+                // Create records for each scaled version & add them to the records array, smallest first.
+                qq.each(sizes, function(idx, sizeRecord) {
+                    var outputType = self._determineOutputType({
+                        defaultType: defaultType,
+                        requestedType: sizeRecord.type,
                         refType: originalBlob.type
-                    }),
-                    blob: new qq.BlobProxy(originalBlob,
-                        qq.bind(self._generateScaledImage, self, sizeRecord.max, orient, log))
-                });
-            });
+                    });
 
-            // Finally, add a record for the original file
-            records.push({
+                    records.push({
+                        uuid: qq.getUniqueId(),
+                        name: self._getName(originalFileName, {
+                            name: sizeRecord.name,
+                            type: outputType,
+                            refType: originalBlob.type
+                        }),
+                        blob: new qq.BlobProxy(originalBlob,
+                            qq.bind(self._generateScaledImage, self, {
+                                maxSize: sizeRecord.maxSize,
+                                orient: orient,
+                                type: outputType,
+                                quality: defaultQuality,
+                                failedText: failedToScaleText,
+                                includeExif: includeExif,
+                                log: log
+                            }))
+                        }
+                    );
+                });
+            }
+
+            // Finally, add a record for the original file (if requested)
+            includeReference && records.push({
                 uuid: originalFileUuid,
                 name: originalFileName,
                 blob: originalBlob
             });
 
             return records;
+        },
+
+        handleNewFile: function(file, name, uuid, size, fileList, uuidParamName, api) {
+            var self = this,
+                buttonId = file.qqButtonId || (file.blob && file.blob.qqButtonId),
+                scaledIds = [],
+                originalId = null,
+                addFileToHandler = api.addFileToHandler,
+                uploadData = api.uploadData,
+                paramsStore = api.paramsStore;
+
+            qq.each(self.getFileRecords(uuid, name, file), function(idx, record) {
+                var relatedBlob = file,
+                    relatedSize = size,
+                    id;
+
+                if (record.blob instanceof qq.BlobProxy) {
+                    relatedBlob = record.blob;
+                    relatedSize = -1;
+                }
+
+                id = uploadData.addFile(record.uuid, record.name, relatedSize);
+
+                if (record.blob instanceof qq.BlobProxy) {
+                    scaledIds.push(id);
+                }
+                else {
+                    originalId = id;
+                }
+
+                addFileToHandler(id, relatedBlob);
+
+                fileList.push({id: id, file: relatedBlob});
+
+            });
+
+            // Tag all items in this group with the IDs of all items in the group.
+            if (scaledIds.length) {
+                qq.each(scaledIds, function(idx, scaledId) {
+                    if (originalId === null) {
+                        uploadData.setGroupIds(scaledId, scaledIds);
+                    }
+                    else {
+                        uploadData.setGroupIds(scaledId, scaledIds.concat([originalId]));
+                    }
+                });
+
+                originalId !== null && uploadData.setGroupIds(originalId, scaledIds.concat([originalId]));
+            }
+
+            // If we are potentially uploading an original file and some scaled versions,
+            // ensure the scaled versions include reference's to the parent's UUID and size
+            // in their associated upload requests.
+            if (originalId !== null) {
+                qq.each(scaledIds, function(idx, scaledId) {
+                    var params = {
+                        qqparentuuid: uploadData.retrieve({id: originalId}).uuid,
+                        qqparentsize: uploadData.retrieve({id: originalId}).size
+                    };
+
+                    // Make SURE the UUID for each scaled image is sent with the upload request,
+                    // to be consistent (since we need to ensure it is sent for the original file as well).
+                    params[uuidParamName] = uploadData.retrieve({id: scaledId}).uuid;
+
+                    uploadData.setParentId(scaledId, originalId);
+                    paramsStore.addReadOnly(scaledId, params);
+                });
+
+                // If any scaled images are tied to this parent image, be SURE we send its UUID as an upload request
+                // parameter as well.
+                if (scaledIds.length) {
+                    (function() {
+                        var param = {};
+                        param[uuidParamName] = uploadData.retrieve({id: originalId}).uuid;
+                        paramsStore.addReadOnly(originalId, param);
+                    }());
+                }
+            }
         }
     });
 };
 
 qq.extend(qq.Scaler.prototype, {
+    scaleImage: function(id, specs, api) {
+        "use strict";
+
+        var scalingEffort = new qq.Promise(),
+            log = api.log,
+            file = api.getFile(id),
+            uploadData = api.uploadData.retrieve({id: id}),
+            name = uploadData && uploadData.name,
+            uuid = uploadData && uploadData.uuid,
+            scalingOptions = {
+                sendOriginal: false,
+                orient: specs.orient,
+                defaultType: specs.type || null,
+                defaultQuality: specs.quality,
+                failedToScaleText: "Unable to scale",
+                sizes: [{name: "", maxSize: specs.maxSize}]
+            },
+            scaler = new qq.Scaler(scalingOptions, log);
+
+        if (!qq.Scaler || !qq.supportedFeatures.imagePreviews || !file) {
+            scalingEffort.failure();
+
+            log("Could not generate requested scaled image for " + id + ".  " +
+                "Scaling is either not possible in this browser, or the file could not be located.", "error");
+        }
+        else {
+            (qq.bind(function() {
+                var record;
+
+                // Assumption: There will never be more than one record
+                record = scaler.getFileRecords(uuid, name, file)[0];
+
+                if (record) {
+                    record.blob.create().then(scalingEffort.success, scalingEffort.failure);
+                }
+                else {
+                    log(id + " is not a scalable image!", "error");
+                    scalingEffort.failure();
+                }
+            }, this)());
+        }
+
+        return scalingEffort;
+    },
+
+    // NOTE: We cannot reliably determine at this time if the UA supports a specific MIME type for the target format.
+    // image/jpeg and image/png are the only safe choices at this time.
+    _determineOutputType: function(spec) {
+        "use strict";
+
+        var requestedType = spec.requestedType,
+            defaultType = spec.defaultType,
+            referenceType = spec.refType;
+
+        // If a default type and requested type have not been specified, this should be a
+        // JPEG if the original type is a JPEG, otherwise, a PNG.
+        if (!defaultType && !requestedType) {
+            if (referenceType !== "image/jpeg") {
+                return "image/png";
+            }
+            return referenceType;
+        }
+
+        // A specified default type is used when a requested type is not specified.
+        if (!requestedType) {
+            return defaultType;
+        }
+
+        // If requested type is specified, use it, as long as this recognized type is supported by the current UA
+        if (qq.indexOf(Object.keys(qq.Identify.prototype.PREVIEWABLE_MIME_TYPES), requestedType) >= 0) {
+            if (requestedType === "image/tiff") {
+                return qq.supportedFeatures.tiffPreviews ? requestedType : defaultType;
+            }
+
+            return requestedType;
+        }
+
+        return defaultType;
+    },
+
     // Get a file name for a generated scaled file record, based on the provided scaled image description
     _getName: function(originalName, scaledVersionProperties) {
         "use strict";
@@ -88,32 +317,83 @@ qq.extend(qq.Scaler.prototype, {
         sizes = qq.extend([], sizes);
 
         return sizes.sort(function(a, b) {
-            if (a.max > b.max) {
+            if (a.maxSize > b.maxSize) {
                 return 1;
             }
-            if (a.max < b.max) {
+            if (a.maxSize < b.maxSize) {
                 return -1;
             }
             return 0;
         });
     },
 
-    _generateScaledImage: function(size, orient, log, sourceFile) {
+    _generateScaledImage: function(spec, sourceFile) {
         "use strict";
 
         var self = this,
+            log = spec.log,
+            maxSize = spec.maxSize,
+            orient = spec.orient,
+            type = spec.type,
+            quality = spec.quality,
+            failedText = spec.failedText,
+            includeExif = spec.includeExif && sourceFile.type === "image/jpeg" && type === "image/jpeg",
             scalingEffort = new qq.Promise(),
             imageGenerator = new qq.ImageGenerator(log),
             canvas = document.createElement("canvas");
 
-        imageGenerator.generate(sourceFile, canvas, {maxSize: size, orient: orient}).then(function() {
-            var dataUri = canvas.toDataURL(),
-                blob = self._dataUriToBlob(dataUri);
+        log("Attempting to generate scaled version for " + sourceFile.name);
 
-            scalingEffort.success(blob);
+        imageGenerator.generate(sourceFile, canvas, {maxSize: maxSize, orient: orient}).then(function() {
+            var scaledImageDataUri = canvas.toDataURL(type, quality),
+                signalSuccess = function() {
+                    log("Success generating scaled version for " + sourceFile.name);
+                    var blob = self._dataUriToBlob(scaledImageDataUri);
+                    scalingEffort.success(blob);
+                };
+
+            if (includeExif) {
+                self._insertExifHeader(sourceFile, scaledImageDataUri, log).then(function(scaledImageDataUriWithExif) {
+                    scaledImageDataUri = scaledImageDataUriWithExif;
+                    signalSuccess();
+                },
+                function() {
+                    log("Problem inserting EXIF header into scaled image.  Using scaled image w/out EXIF data.", "error");
+                    signalSuccess();
+                });
+            }
+            else {
+                signalSuccess();
+            }
+        }, function() {
+            log("Failed attempt to generate scaled version for " + sourceFile.name, "error");
+            scalingEffort.failure(failedText);
         });
 
         return scalingEffort;
+    },
+
+    // Attempt to insert the original image's EXIF header into a scaled version.
+    _insertExifHeader: function(originalImage, scaledImageDataUri, log) {
+        "use strict";
+
+        var reader = new FileReader(),
+            insertionEffort = new qq.Promise(),
+            originalImageDataUri = "";
+
+        reader.onload = function() {
+            originalImageDataUri = reader.result;
+            insertionEffort.success(ExifRestorer.restore(originalImageDataUri, scaledImageDataUri));
+        };
+
+        reader.onerror = function() {
+            log("Problem reading " + originalImage.name + " during attempt to transfer EXIF data to scaled version.", "error");
+            insertionEffort.failure();
+        };
+
+        reader.readAsDataURL(originalImage);
+
+        return insertionEffort;
     },
 
 

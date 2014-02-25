@@ -9,9 +9,7 @@ qq.UploadHandler = function(o, namespace) {
     "use strict";
 
     var queue = [],
-        generationWaitingQueue = [],
-        generationDoneQueue = [],
-        options, log, handlerImpl;
+        preventRetryResponse, options, log, handlerImpl;
 
     // Default options, can be overridden by the user
     options = {
@@ -59,29 +57,73 @@ qq.UploadHandler = function(o, namespace) {
         onResume: function(id, fileName, chunkData){},
         onUuidChanged: function(id, newUuid){},
         getName: function(id) {},
-        setSize: function(id, newSize) {}
-
+        setSize: function(id, newSize) {},
+        isQueued: function(id) {},
+        getIdsInGroup: function(id) {}
     };
     qq.extend(options, o);
+
+    preventRetryResponse = (function() {
+        var response = {};
+
+        response[options.preventRetryParam] = true;
+
+        return response;
+    }());
 
     log = options.log;
 
     // Returns a qq.BlobProxy, or an actual File/Blob if no proxy is involved, or undefined
     // if none of these are available for the ID
-    function getBlobOrProxy(id) {
+    function getProxyOrBlob(id) {
         return (handlerImpl.getProxy && handlerImpl.getProxy(id)) ||
             (handlerImpl.getFile && handlerImpl.getFile(id));
     }
 
-    // For Blobs that are part of a group of scaled images, along with a reference image,
+    // Used when determining if a grouped Blob should be uploaded
+    function waitingAndReadyForUpload(id) {
+        return !!handlerImpl.getFile(id);
+    }
+
+    // Used when determining if a grouped Blob should be uploaded
+    function eligibleForUpload(id) {
+        return options.isQueued(id);
+    }
+
+    // Upload any grouped blobs, in the proper order, that are ready to be uploaded
+    function maybeReadyToUpload(id) {
+        var idsInGroup = options.getIdsInGroup(id),
+            uploadedThisId = false;
+
+        if (idsInGroup && idsInGroup.length) {
+            log("Maybe ready to upload grouped file " + id);
+
+            qq.each(idsInGroup, function(idx, idInGroup) {
+                if (eligibleForUpload(idInGroup) && waitingAndReadyForUpload(idInGroup)) {
+                    uploadedThisId = idInGroup === id;
+                    handlerImpl.upload(idInGroup);
+                }
+                else if (eligibleForUpload(idInGroup)) {
+                    return false;
+                }
+            });
+        }
+        else {
+            uploadedThisId = true;
+            handlerImpl.upload(id);
+        }
+
+        return uploadedThisId;
+    }
+
+    // For Blobs that are part of a group of generated images, along with a reference image,
     // this will ensure the blobs in the group are uploaded in the order they were triggered,
     // even if some async processing must be completed on one or more Blobs first.
     function startBlobUpload(id, blob) {
-        // If we don't have a file/blob yet, request it, and then submit the
-        // upload to the specific handler once the blob is available.
+        // If we don't have a file/blob yet & no file/blob exists for this item, request it,
+        // and then submit the upload to the specific handler once the blob is available.
         // ASSUMPTION: This condition will only ever be true if XHR uploading is supported.
-        if (blob && qq.BlobProxy && blob instanceof qq.BlobProxy) {
-            generationWaitingQueue.push(id);
+        if (blob && !handlerImpl.getFile(id) && blob instanceof qq.BlobProxy) {
 
             // Blob creation may take some time, so the caller may want to update the
             // UI to indicate that an operation is in progress, even before the actual
@@ -89,62 +131,46 @@ qq.UploadHandler = function(o, namespace) {
             options.onUploadPrep(id);
 
             log("Attempting to generate a blob on-demand for " + id);
-            blob.create().then(function(actualBlob) {
+            blob.create().then(function(generatedBlob) {
                 log("Generated an on-demand blob for " + id);
 
-                // Update record associated with this file by providing the actual Blob
-                handlerImpl.updateBlob(id, actualBlob);
+                // Update record associated with this file by providing the generated Blob
+                handlerImpl.updateBlob(id, generatedBlob);
 
                 // Propagate the size for this generated Blob
-                options.setSize(id, actualBlob.size);
+                options.setSize(id, generatedBlob.size);
 
                 // Order handler to recalculate chunking possibility, if applicable
                 handlerImpl.reevaluateChunking(id);
 
-                maybeUploadGenerationQueueBlobs(id);
+                maybeReadyToUpload(id);
+            },
+
+            // Blob could not be generated.  Fail the upload & attempt to prevent retries.  Also bubble error message.
+            function(errorMessage) {
+                var errorResponse = {};
+
+                if (errorMessage) {
+                    errorResponse.error = errorMessage;
+                }
+
+                log(qq.format("Failed to generate scaled version for ID {}.  Error message: {}.", id, errorMessage), "error");
+
+                options.onComplete(id, options.getName(id), qq.extend(errorResponse, preventRetryResponse), null);
+                maybeReadyToUpload(id);
+                dequeue(id);
             });
         }
         else {
-            if (generationWaitingQueue.length) {
-                generationWaitingQueue.push(id);
-                generationDoneQueue.push(id);
-            }
-            else {
-                handlerImpl.upload(id);
-                return true;
-            }
+            return maybeReadyToUpload(id);
         }
 
         return false;
     }
 
-    // When a Blob tied to a group of generated Blobs is ready for upload
-    // (and any async processing needed by this Blob is done) this will be called
-    // with the Blob's ID.  Since we want to ensure that these grouped Blobs are
-    // uploaded in a specific order, this will iterate through the ordered list of
-    // Blobs to upload, and only upload those that are ready, stopping when it hits one that isn't.
-    function maybeUploadGenerationQueueBlobs(id) {
-        var waitingForGenerationQueueCopy = qq.extend([], generationWaitingQueue);
-
-        generationDoneQueue.push(id);
-
-        qq.each(waitingForGenerationQueueCopy, function(idx, id) {
-            var generationDoneQueueIdx = qq.indexOf(generationDoneQueue, id);
-
-            if (generationDoneQueueIdx >= 0) {
-                log("Submitting " + id + " to be uploaded as its turn in the generation queue is up.");
-                generationDoneQueue.splice(generationDoneQueueIdx, 1);
-                handlerImpl.upload(generationWaitingQueue.shift());
-            }
-            else {
-                return false;
-            }
-        });
-    }
-
     // Called whenever a file is to be uploaded.  Returns true if the file will be uploaded at once.
     function startUpload(id) {
-        var blobToUpload = getBlobOrProxy(id);
+        var blobToUpload = getProxyOrBlob(id);
 
         if (blobToUpload) {
             return startBlobUpload(id, blobToUpload);
@@ -164,7 +190,7 @@ qq.UploadHandler = function(o, namespace) {
             max = options.maxConnections,
             nextId;
 
-        if (qq.BlobProxy && getBlobOrProxy(id) instanceof qq.BlobProxy) {
+        if (getProxyOrBlob(id) instanceof qq.BlobProxy) {
             log("Generated blob upload has ended for " + id + ", disposing generated blob.");
             delete handlerImpl._getFileState(id).file;
         }
@@ -172,7 +198,7 @@ qq.UploadHandler = function(o, namespace) {
         if (i >= 0) {
             queue.splice(i, 1);
 
-            if (queue.length >= max && i < max){
+            if (queue.length >= max && i < max) {
                 nextId = queue[max-1];
                 startUpload(nextId);
             }
@@ -221,9 +247,12 @@ qq.UploadHandler = function(o, namespace) {
         },
 
         retry: function(id) {
-            var i = qq.indexOf(queue, id);
+            var i = qq.indexOf(queue, id),
+                blobOrProxy = getProxyOrBlob(id),
+                isProxy = blobOrProxy && blobOrProxy instanceof qq.BlobProxy;
+
             if (i >= 0) {
-                return handlerImpl.upload(id, true);
+                return isProxy ? startUpload(id) : handlerImpl.upload(id, true);
             }
             else {
                 return this.upload(id);
@@ -269,6 +298,11 @@ qq.UploadHandler = function(o, namespace) {
             }
 
             return handlerImpl.getFile && handlerImpl.getFile(id);
+        },
+
+        // Returns true if the Blob associated with the ID is related to a proxy s
+        isProxied: function(id) {
+            return !!(handlerImpl.getProxy && handlerImpl.getProxy(id));
         },
 
         getInput: function(id) {
