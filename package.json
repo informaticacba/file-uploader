@@ -69,11 +69,11 @@
     "grunt-nodestatic": "0.1.2"
   },
   "dependencies": {
-    "bower": "1.2.5",
+    "bower": "1.7.5",
     "coffee-script": "~1.6.3",
-    "glob": "~3.2.6",
-    "grunt": "~0.4.1",
-    "karma": "~0.10.9",
+    "glob": "~5.0.15",
+    "grunt": "~1.0.0",
+    "karma": "~0.13.12",
     "optimist": "~0.6.0",
     "request": "~2.21.0",
     "semver": "2.0.x",
